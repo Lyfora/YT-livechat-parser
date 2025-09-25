@@ -6,6 +6,7 @@ import os
 import asyncio
 import googleapiclient.discovery
 import re
+import webserver
 
 # Load environment variables
 load_dotenv()
@@ -579,4 +580,5 @@ if __name__ == "__main__":
     elif not YOUTUBE_API_KEY:
         print("Error: YOUTUBE_API_KEY not found in environment variables")
     else:
+        webserver.keep_alive()
         bot.run(DISCORD_TOKEN, log_handler=handler, log_level=logging.DEBUG)
