@@ -1,0 +1,17 @@
+[Unit]
+Description=Lily Bot for YouTube Live Chat & Trakteer
+After=network.target
+
+[Service]
+Type=simple
+User=rafael
+WorkingDirectory=/Users/rafael/LilyBot/YT-livechat-parser
+ExecStart=/usr/bin/python3 lily-bot.py
+Restart=always
+RestartSec=10
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=lilybot
+
+[Install]
+WantedBy=multi-user.target

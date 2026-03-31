@@ -7,11 +7,21 @@ import asyncio
 import googleapiclient.discovery
 import re
 import webserver
+import time
+import pickle
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
 
 # Load environment variables
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
+TRAKTEER_TOKEN = os.getenv('TRAKTEER_TOKEN', '')
+CLIENT_ID = os.getenv('CLIENT_ID')
+CLIENT_SECRET = os.getenv('CLIENT_SECRET')
+
+# Scopes for YouTube API (force-ssl is required for reading/writing chat)
+YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 
 # Setup logging
 handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
@@ -29,8 +39,10 @@ youtube_client = None
 
 # SongQueue
 song_list = {}
-current_idx = 0
+# current_idx is wrapped in a dict so webserver.py can mutate it from a different thread
+current_idx_ref = {'value': 0}
 played_idx = 0
+last_ngintip_time = 0  # To track cooldown for !ngintip from YouTube chat
 
 def extract_youtube_id(url: str) -> str:
     """Extract YouTube video ID from various URL formats"""
@@ -48,6 +60,64 @@ def extract_youtube_id(url: str) -> str:
             return match.group(1)
     
     return None
+
+async def get_authenticated_youtube_client():
+    """Get authenticated YouTube service using OAuth2 flow."""
+    creds = None
+    # token.pickle stores the user's access and refresh tokens
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+            
+    # If there are no (valid) credentials available, let the user log in.
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            print("Refreshing YouTube token...")
+            creds.refresh(Request())
+        else:
+            if not CLIENT_ID or not CLIENT_SECRET:
+                print("Error: CLIENT_ID or CLIENT_SECRET missing in .env")
+                return None
+                
+            print("Starting YouTube OAuth2 flow...")
+            client_config = {
+                "installed": {
+                    "client_id": CLIENT_ID,
+                    "client_secret": CLIENT_SECRET,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                }
+            }
+            flow = InstalledAppFlow.from_client_config(client_config, YOUTUBE_SCOPES)
+            creds = flow.run_local_server(port=0)
+            
+        # Save the credentials for the next run
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
+
+    return googleapiclient.discovery.build("youtube", "v3", credentials=creds)
+
+async def send_youtube_message(live_chat_id, text):
+    """Send a message to the YouTube live chat."""
+    if not youtube_client:
+        return
+        
+    try:
+        youtube_client.liveChatMessages().insert(
+            part="snippet",
+            body={
+                "snippet": {
+                    "liveChatId": live_chat_id,
+                    "type": "textMessageEvent",
+                    "textMessageDetails": {
+                        "messageText": text
+                    }
+                }
+            }
+        ).execute()
+        print(f"Sent to YouTube: {text}")
+    except Exception as e:
+        print(f"Error sending to YouTube: {e}")
 
 async def get_live_chat_id(video_id: str) -> str:
     """Get the live chat ID for a YouTube video"""
@@ -69,7 +139,7 @@ async def get_live_chat_id(video_id: str) -> str:
 
 async def fetch_live_chat_messages(video_id: str, discord_channel):
     """Fetch live chat messages and send them to Discord channel"""
-    global current_idx, song_list  # Fix: Add global declaration
+    global song_list  # current_idx_ref is a dict, no need to declare global
     
     live_chat_id = await get_live_chat_id(video_id)
     
@@ -103,6 +173,43 @@ async def fetch_live_chat_messages(video_id: str, discord_channel):
                 message_text = item["snippet"]["displayMessage"]
                 author = item["authorDetails"]["displayName"]
                 
+                # Handle !ngintip (peek at upcoming songs)
+                if message_text.lower().startswith('!ngintip'):
+                    current_time = time.time()
+                    global last_ngintip_time
+                    
+                    if current_time - last_ngintip_time < 120:
+                        # Still on cooldown
+                        continue
+                    
+                    last_ngintip_time = current_time
+                    next_songs = []
+                    # Get next 3 songs after played_idx
+                    for i in range(1, 4):
+                        target_id = played_idx + i
+                        if target_id in song_list:
+                            next_songs.append(f"#{target_id}: {song_list[target_id][0]} ({song_list[target_id][1]})")
+                    
+                    if next_songs:
+                        peek_text = "👀 **Top Upcoming Songs:**\n" + "\n".join(next_songs)
+                    else:
+                        peek_text = "👀 **Queue is empty!** No upcoming songs."
+                    
+                    peek_embed = discord.Embed(
+                        title="YouTube Chat Peek (!ngintip)",
+                        description=peek_text,
+                        color=discord.Color.gold()
+                    )
+                    peek_embed.set_author(name=author)
+                    await discord_channel.send(embed=peek_embed)
+                    
+                    # Also send to YouTube Live Chat
+                    # Remove markdown from peek_text for YouTube
+                    yt_text = peek_text.replace("**", "")
+                    await send_youtube_message(live_chat_id, yt_text)
+                    
+                    continue
+
                 # Only process messages that start with !req
                 if not message_text.lower().startswith('!req'):
                     continue
@@ -119,10 +226,11 @@ async def fetch_live_chat_messages(video_id: str, discord_channel):
                 song_list_temp = message_text[5:]
 
                 # Add it to the list
-                current_idx += 1
-                song_list[current_idx] = [song_list_temp,author]
+                current_idx_ref['value'] += 1
+                song_list[current_idx_ref['value']] = [song_list_temp, author]
                 
                 await discord_channel.send(embed=embed)
+                await send_song_list(discord_channel)
 
             next_page_token = response.get("nextPageToken")
             
@@ -145,12 +253,12 @@ async def on_ready():
     global youtube_client
     print(f"Bot is ready! Logged in as {bot.user.name}")
     
-    # Initialize YouTube API client
-    if YOUTUBE_API_KEY:
-        youtube_client = googleapiclient.discovery.build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
-        print("YouTube API client initialized")
+    # Initialize YouTube API client (Authenticated)
+    youtube_client = await get_authenticated_youtube_client()
+    if youtube_client:
+        print("YouTube API client (OAuth2) initialized")
     else:
-        print("Warning: YouTube API key not found!")
+        print("Warning: YouTube API client failed to initialize!")
 
 @bot.command(name='hello')
 async def hello(ctx):
@@ -160,7 +268,7 @@ async def hello(ctx):
 @bot.command(name='start_live_chat')
 async def start_live_chat(ctx, url: str):
     """Start monitoring YouTube live chat and send messages to current Discord channel"""
-    global song_list, current_idx, played_idx  # Fix: Reset queue for new stream
+    global song_list, played_idx  # current_idx_ref is a dict, no need to declare global
     
     if not youtube_client:
         await ctx.send("❌ YouTube API is not configured. Please check your API key.")
@@ -177,9 +285,9 @@ async def start_live_chat(ctx, url: str):
         return
     
     # Reset the queue for new stream
-    # song_list = {}
-    # current_idx = 0
-    # played_idx = 0
+    song_list.clear()
+    current_idx_ref['value'] = 0
+    played_idx = 0
     
     # Store the active stream
     active_streams[ctx.channel.id] = video_id
@@ -225,7 +333,7 @@ async def current_song(ctx):
             inline=False
         )
     elif played_idx == 0:
-        if current_idx >= 1:
+        if current_idx_ref['value'] >= 1:
             song_embed.add_field(
                 name="Current Song",
                 value=f"Belum ada lagu yang dimainkan. Next: {song_list[1][0]} - {song_list[1][1]}",
@@ -262,7 +370,7 @@ async def next(ctx):
             value="Tidak ada lagu dalam queue!",
             inline=False
         )
-    elif played_idx == 0 and current_idx >= 1:
+    elif played_idx == 0 and current_idx_ref['value'] >= 1:
         # Start playing the first song
         played_idx = 1
         next_song.add_field(
@@ -270,13 +378,13 @@ async def next(ctx):
             value=f"{song_list[played_idx][0]} - {song_list[played_idx][1]}",
             inline=False
         )
-        if current_idx > 1:
+        if current_idx_ref['value'] > 1:
             next_song.add_field(
                 name="Next Song",
                 value=f"{song_list[played_idx + 1][0]} - {song_list[played_idx + 1][1]}",
                 inline=False
             )
-    elif played_idx < current_idx:
+    elif played_idx < current_idx_ref['value']:
         # Move to next song
         played_idx += 1
         next_song.add_field(
@@ -284,7 +392,7 @@ async def next(ctx):
             value=f"{song_list[played_idx][0]} - {song_list[played_idx][1]}",
             inline=False
         )
-        if played_idx < current_idx:
+        if played_idx < current_idx_ref['value']:
             next_song.add_field(
                 name="Next Song",
                 value=f"{song_list[played_idx + 1][0]} - {song_list[played_idx + 1][1]}",
@@ -303,20 +411,19 @@ async def next(ctx):
             value="Sudah di lagu terakhir!",
             inline=False
         )
-    
     await ctx.send(embed=next_song)
+    await send_song_list(ctx.channel)
 
 @bot.command(name='add')
 async def add(ctx, *, song):
     """Add song from Trakteer"""
-    global current_idx
     if ctx.channel.id in active_streams:
         print(song, song.split("-"))
         song_list_format = "(Trakteer) - " + song.split("-")[0]
         nama_request = song.split("-")[1]
-        current_idx += 1
+        current_idx_ref['value'] += 1
 
-        song_list[current_idx] = [song_list_format,nama_request]
+        song_list[current_idx_ref['value']] = [song_list_format, nama_request]
         embed = discord.Embed(
                     description=song_list_format,
                     color=discord.Color.red()
@@ -324,19 +431,17 @@ async def add(ctx, *, song):
         embed.set_author(name=nama_request)
         embed.set_footer(text="Trakteer Request Chat")
         await ctx.send(embed=embed)
+        await send_song_list(ctx.channel)
     else:
         await ctx.send("❌ No active live chat monitoring in this channel.")
 
-@bot.command(name='list_song')
-async def list_song(ctx):
-    """Check the List Song Queue with Discord embed limit handling"""
-    # Create embed with valid color
+async def send_song_list(channel):
+    """Build and send the full queue embed to any channel."""
     queue_embed = discord.Embed(
         title="List song",
         color=discord.Color.magenta()
     )
     
-    # Check if queue is empty
     if not song_list:
         queue_embed.add_field(
             name="Queue Status",
@@ -346,82 +451,91 @@ async def list_song(ctx):
     else:
         total_songs = len(song_list)
         
-        # Determine which songs to show based on Discord's 25 field limit
         if total_songs <= 24:
-            # Show all songs if 24 or fewer
-            songs_to_show = list(range(1, current_idx + 1))
+            songs_to_show = list(range(1, current_idx_ref['value'] + 1))
         else:
-            # Show last 3 played songs + all unplayed songs
             songs_to_show = []
-            
-            # Get last 3 played songs
             if played_idx > 0:
-                start_played = max(1, played_idx - 2)  # Last 3 played songs
+                start_played = max(1, played_idx - 2)
                 songs_to_show.extend(range(start_played, played_idx + 1))
-            
-            # Add all unplayed songs
-            if played_idx < current_idx:
-                songs_to_show.extend(range(played_idx + 1, current_idx + 1))
-            
-            # Ensure we don't exceed 24 fields (keeping 1 for potential gap indicator)
+            if played_idx < current_idx_ref['value']:
+                songs_to_show.extend(range(played_idx + 1, current_idx_ref['value'] + 1))
             if len(songs_to_show) > 23:
-                # Prioritize current and upcoming songs
                 if played_idx > 0:
-                    # Show current + next songs up to limit or end of queue
-                    max_next_songs = min(22, current_idx - played_idx)
+                    max_next_songs = min(22, current_idx_ref['value'] - played_idx)
                     songs_to_show = [played_idx] + list(range(played_idx + 1, played_idx + 1 + max_next_songs))
                 else:
-                    # Show first 23 songs or all if less
-                    max_songs = min(23, current_idx)
+                    max_songs = min(23, current_idx_ref['value'])
                     songs_to_show = list(range(1, max_songs + 1))
         
-        # Add gap indicator if we're not showing all songs
         show_gap = total_songs > 24 and played_idx > 3
         
-        # Display songs
-        for i, song_id in enumerate(songs_to_show):
-            # Add gap indicator before current song if needed
+        for song_id in songs_to_show:
             if show_gap and song_id == played_idx and played_idx > 3:
                 queue_embed.add_field(
                     name="...",
                     value=f"⏸️ {played_idx - 3} songs skipped for display",
                     inline=False
                 )
-            
             if song_id < played_idx:
-                # Songs that have been played
                 queue_embed.add_field(
                     name=f"#{song_id}",
                     value=f"✅ {song_list[song_id][0]} - {song_list[song_id][1]}",
                     inline=False
                 )
             elif song_id == played_idx:
-                # Currently playing song
                 queue_embed.add_field(
                     name=f"#{song_id} 🎵",
                     value=f"▶️ {song_list[song_id][0]} - {song_list[song_id][1]}",
                     inline=False
                 )
             else:
-                # Upcoming songs
                 queue_embed.add_field(
                     name=f"#{song_id}",
                     value=f"⏳ {song_list[song_id][0]} - {song_list[song_id][1]}",
                     inline=False
                 )
     
-    # Add queue info at the footer
     if song_list:
         queue_embed.set_footer(text=f"{played_idx}/{len(song_list)} played | Total: {len(song_list)} songs")
     else:
         queue_embed.set_footer(text="No songs in queue")
     
-    await ctx.send(embed=queue_embed)
+    await channel.send(embed=queue_embed)
+
+@bot.command(name='list_song')
+async def list_song(ctx):
+    """Check the List Song Queue"""
+    await send_song_list(ctx.channel)
+
+@bot.command(name='ngintip')
+@commands.cooldown(1, 120, commands.BucketType.guild)
+async def ngintip(ctx):
+    """Peek at the next 3 upcoming songs"""
+    next_songs = []
+    # Get next 3 songs after played_idx
+    for i in range(1, 4):
+        target_id = played_idx + i
+        if target_id in song_list:
+            next_songs.append(f"#{target_id}: {song_list[target_id][0]} ({song_list[target_id][1]})")
+    
+    if next_songs:
+        peek_text = "👀 **Top Upcoming Songs:**\n" + "\n".join(next_songs)
+    else:
+        peek_text = "👀 **Queue is empty!** No upcoming songs."
+    
+    peek_embed = discord.Embed(
+        title="Queue Peek (!ngintip)",
+        description=peek_text,
+        color=discord.Color.gold()
+    )
+    peek_embed.set_author(name=ctx.author.name)
+    await ctx.send(embed=peek_embed)
 
 @bot.command(name='delete')
 async def delete_song(ctx, song_id: int):
     """Delete a song from the queue by its ID"""
-    global current_idx, played_idx
+    global played_idx
     
     # Check if queue is empty
     if not song_list:
@@ -429,8 +543,8 @@ async def delete_song(ctx, song_id: int):
         return
     
     # Check if song_id is valid
-    if song_id < 1 or song_id > current_idx:
-        await ctx.send(f"❌ Invalid song ID! Please use a number between 1 and {current_idx}")
+    if song_id < 1 or song_id > current_idx_ref['value']:
+        await ctx.send(f"❌ Invalid song ID! Please use a number between 1 and {current_idx_ref['value']}")
         return
     
     # Check if song exists in the dictionary
@@ -463,7 +577,7 @@ async def delete_song(ctx, song_id: int):
         old_played_id = played_idx
         new_played_id = 0
         
-        for old_id in range(1, current_idx + 1):
+        for old_id in range(1, current_idx_ref['value'] + 1):
             if old_id in old_song_list:
                 song_list[new_id] = old_song_list[old_id]
                 
@@ -476,11 +590,11 @@ async def delete_song(ctx, song_id: int):
                 new_id += 1
         
         # Update global variables
-        current_idx = len(song_list)
+        current_idx_ref['value'] = len(song_list)
         played_idx = new_played_id
     else:
         # Queue is now empty
-        current_idx = 0
+        current_idx_ref['value'] = 0
         played_idx = 0
     
     # Send confirmation message
@@ -541,6 +655,7 @@ async def help_live(ctx):
             "- !list_song                = Menampilkan semua lagu, lengkap dengan status\n"
             "- !current_song             = Menampilkan lagu yang sedang dinyanyikan\n"
             "- !next                     = Pindah ke lagu selanjutnya\n"
+            "- !ngintip                  = Intip top 3 lagu selanjutnya di queue\n"
             "- !add <lagu>-<req>         = Menambah lagu (khusus Trakteer)\n"
             "- !start_live_chat <link>   = Memulai bot\n"
             "- !end_live_chat            = Mematikan bot\n"
@@ -567,6 +682,8 @@ async def help_live(ctx):
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send("❌ Missing required argument. Use `!help_live` for command usage.")
+    elif isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"⏳ Command on cooldown! Please wait {error.retry_after:.1f}s.")
     elif isinstance(error, commands.CommandNotFound):
         pass  # Ignore unknown commands
     else:
@@ -580,5 +697,7 @@ if __name__ == "__main__":
     elif not YOUTUBE_API_KEY:
         print("Error: YOUTUBE_API_KEY not found in environment variables")
     else:
+        # Wire shared state into webserver so the Trakteer webhook can use it
+        webserver.setup(bot, song_list, active_streams, current_idx_ref, send_song_list)
         webserver.keep_alive()
         bot.run(DISCORD_TOKEN, log_handler=handler, log_level=logging.DEBUG)
