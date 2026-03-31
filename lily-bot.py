@@ -80,6 +80,7 @@ async def get_authenticated_youtube_client():
                 return None
                 
             print("Starting YouTube OAuth2 flow...")
+            print(">>> Open the URL below in your browser, authorize, then paste the code back here.")
             client_config = {
                 "installed": {
                     "client_id": CLIENT_ID,
@@ -89,7 +90,7 @@ async def get_authenticated_youtube_client():
                 }
             }
             flow = InstalledAppFlow.from_client_config(client_config, YOUTUBE_SCOPES)
-            creds = flow.run_local_server(port=0)
+            creds = flow.run_console()
             
         # Save the credentials for the next run
         with open('token.pickle', 'wb') as token:
