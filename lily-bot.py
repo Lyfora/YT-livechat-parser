@@ -63,40 +63,46 @@ def extract_youtube_id(url: str) -> str:
 
 async def get_authenticated_youtube_client():
     """Get authenticated YouTube service using OAuth2 flow."""
-    creds = None
-    # token.pickle stores the user's access and refresh tokens
-    if os.path.exists('token.pickle'):
-        with open('token.pickle', 'rb') as token:
-            creds = pickle.load(token)
-            
-    # If there are no (valid) credentials available, let the user log in.
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            print("Refreshing YouTube token...")
-            creds.refresh(Request())
-        else:
-            if not CLIENT_ID or not CLIENT_SECRET:
-                print("Error: CLIENT_ID or CLIENT_SECRET missing in .env")
-                return None
+    try:
+        creds = None
+        # token.pickle stores the user's access and refresh tokens
+        if os.path.exists('token.pickle'):
+            with open('token.pickle', 'rb') as token:
+                creds = pickle.load(token)
                 
-            print("Starting YouTube OAuth2 flow...")
-            print(">>> Open the URL below in your browser, authorize, then paste the code back here.")
-            client_config = {
-                "installed": {
-                    "client_id": CLIENT_ID,
-                    "client_secret": CLIENT_SECRET,
-                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                    "token_uri": "https://oauth2.googleapis.com/token",
+        # If there are no (valid) credentials available, let the user log in.
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                print("Refreshing YouTube token...")
+                creds.refresh(Request())
+                print("YouTube token refreshed successfully!")
+            else:
+                if not CLIENT_ID or not CLIENT_SECRET:
+                    print("Error: CLIENT_ID or CLIENT_SECRET missing in .env")
+                    return None
+                    
+                print("Starting YouTube OAuth2 flow...")
+                print(">>> Open the URL below in your browser, authorize, then paste the code back here.")
+                client_config = {
+                    "installed": {
+                        "client_id": CLIENT_ID,
+                        "client_secret": CLIENT_SECRET,
+                        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                        "token_uri": "https://oauth2.googleapis.com/token",
+                    }
                 }
-            }
-            flow = InstalledAppFlow.from_client_config(client_config, YOUTUBE_SCOPES)
-            creds = flow.run_console()
-            
-        # Save the credentials for the next run
-        with open('token.pickle', 'wb') as token:
-            pickle.dump(creds, token)
+                flow = InstalledAppFlow.from_client_config(client_config, YOUTUBE_SCOPES)
+                creds = flow.run_console()
+                
+            # Save the credentials for the next run
+            with open('token.pickle', 'wb') as token:
+                pickle.dump(creds, token)
 
-    return googleapiclient.discovery.build("youtube", "v3", credentials=creds)
+        return googleapiclient.discovery.build("youtube", "v3", credentials=creds)
+    
+    except Exception as e:
+        print(f"❌ YouTube auth error: {type(e).__name__}: {e}")
+        return None
 
 async def send_youtube_message(live_chat_id, text):
     """Send a message to the YouTube live chat."""
