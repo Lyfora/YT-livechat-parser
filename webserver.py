@@ -2,6 +2,9 @@ from flask import Flask, request, jsonify
 from threading import Thread
 import os
 import asyncio
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 app = Flask('')
 
@@ -29,9 +32,16 @@ def home():
 
 @app.route('/trakteer-webhook', methods=['POST'])
 def trakteer_webhook():
+    # --- Debug logging ---
+    logging.info("=== TRAKTEER WEBHOOK HIT ===")
+    logging.info(f"Headers: {dict(request.headers)}")
+    logging.info(f"Body: {request.get_data(as_text=True)}")
+
     # --- Token validation ---
-    token = request.headers.get('X-Trakteer-Token', '')
+    token = request.headers.get('X-Webhook-Token', '')
+    logging.info(f"Received token: '{token}' | Expected: '{TRAKTEER_TOKEN}'")
     if TRAKTEER_TOKEN and token != TRAKTEER_TOKEN:
+        logging.warning("Token mismatch — returning 401")
         return jsonify({"status": "error", "message": "Unauthorized"}), 401
 
     data = request.get_json(silent=True)

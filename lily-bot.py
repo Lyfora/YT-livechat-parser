@@ -177,7 +177,9 @@ async def fetch_live_chat_messages(video_id: str, discord_channel):
                 # Add to processed messages to avoid duplicates
                 processed_messages.add(message_id)
                 
-                message_text = item["snippet"]["displayMessage"]
+                message_text = item["snippet"].get("displayMessage", "")
+                if not message_text:
+                    continue  # skip system/non-text messages
                 author = item["authorDetails"]["displayName"]
                 
                 # Handle !ngintip (peek at upcoming songs)

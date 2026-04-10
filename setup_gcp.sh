@@ -13,7 +13,7 @@ sudo apt install python3 python3-pip git -y
 if [ ! -d "YT-livechat-parser" ]; then
     echo "📂 Cloning repository..."
     # Replace the URL with your real repo URL if needed
-    git clone https://github.com/USERNAME/YT-livechat-parser.git
+    git clone https://github.com/Lyfora/YT-livechat-parser.git
 fi
 
 cd YT-livechat-parser
