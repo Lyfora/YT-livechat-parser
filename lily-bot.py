@@ -44,7 +44,10 @@ youtube_client = None
 song_list = {}
 # current_idx is wrapped in a dict so webserver.py can mutate it from a different thread
 current_idx_ref = {'value': 0}
-played_idx = 0
+# Each list has its own pointer = number of the last song taken from that list
+# (everything in that list up to it is done). `now` = which list the song being sung is from.
+# Dict, so it is mutated in place.
+play_state = {'youtube': 0, 'trakteer': 0, 'now': None}
 # When paused, no new songs are added (shared with webserver.py, hence the dict)
 paused_ref = {'value': False}
 # Auto-pause: once the queue holds `limit` songs, new YouTube-chat requests are ignored,
@@ -68,6 +71,31 @@ def song_source(entry) -> str:
         return entry[2]
     return 'trakteer' if entry[0].startswith('(Trakteer)') else 'youtube'
 
+def song_status(i) -> str:
+    """'done' | 'playing' | 'pending' for song number i."""
+    src = song_source(song_list[i])
+    ptr = play_state[src]
+    if i < ptr:
+        return 'done'
+    if i == ptr:
+        return 'playing' if play_state['now'] == src else 'done'
+    return 'pending'
+
+def now_playing_id() -> int:
+    """Number of the song being sung right now (0 = nothing yet)."""
+    src = play_state['now']
+    return play_state[src] if src else 0
+
+def next_in_source(src) -> int:
+    """Number of the next song in one list (0 = none left). NB: no builtin next() here, !next shadows it."""
+    return min((i for i, s in song_list.items() if song_source(s) == src and i > play_state[src]), default=0)
+
+def played_count(src) -> int:
+    return sum(1 for i, s in song_list.items() if song_source(s) == src and i <= play_state[src])
+
+def reset_play_state():
+    play_state.update(youtube=0, trakteer=0, now=None)
+
 def save_cache():
     if cache_meta['channel_id'] is None:
         return
@@ -77,7 +105,7 @@ def save_cache():
         'date': date.today().isoformat(),
         'song_list': {str(k): v for k, v in song_list.items()},
         'current_idx': current_idx_ref['value'],
-        'played_idx': played_idx,
+        'play_state': dict(play_state),
         'processed_messages': list(processed_messages),
     }
     try:
@@ -90,7 +118,6 @@ def save_cache():
 
 def restore_cache(channel_id) -> bool:
     """Load today's queue for this channel into memory. True if a matching cache was found."""
-    global played_idx
     try:
         with open(CACHE_FILE, encoding='utf-8') as f:
             data = json.load(f)
@@ -102,7 +129,18 @@ def restore_cache(channel_id) -> bool:
     song_list.clear()
     song_list.update(restored)
     current_idx_ref['value'] = data.get('current_idx', len(song_list))
-    played_idx = data.get('played_idx', 0)
+    saved = data.get('play_state')
+    if saved:
+        play_state.update(youtube=saved.get('youtube', 0), trakteer=saved.get('trakteer', 0), now=saved.get('now'))
+    else:
+        # Older cache (single pointer): everything up to it was done, that song is the current one
+        old = data.get('played_idx', 0)
+        reset_play_state()
+        for i, s in song_list.items():
+            if i <= old:
+                play_state[song_source(s)] = max(play_state[song_source(s)], i)
+        if old in song_list:
+            play_state['now'] = song_source(song_list[old])
     processed_messages.clear()
     processed_messages.update(data.get('processed_messages', []))
     return True
@@ -110,10 +148,9 @@ def restore_cache(channel_id) -> bool:
 _BULK_LINE = re.compile(r'^(✅|▶️?|⏳)\s*(.+)$')
 
 def parse_bulk(text: str):
-    """Parse a pasted '#N / ✅ title - author' list. Returns (songs, played_idx)."""
+    """Parse a pasted '#N / ✅ title - author' list. Returns (songs, play_state_dict)."""
     songs = []
-    playing = 0
-    done = 0
+    state = {'youtube': 0, 'trakteer': 0, 'now': None}
     for raw in text.splitlines():
         line = re.sub(r'^#\d+\s*🎵?\s*', '', raw.strip())  # allow '#1 ✅ ...' on one line
         m = _BULK_LINE.match(line)
@@ -124,11 +161,11 @@ def parse_bulk(text: str):
         title, author = title.strip(), author.strip()
         source = 'trakteer' if title.startswith('(Trakteer)') else 'youtube'
         songs.append([title, author, source])
-        if status.startswith('▶'):
-            playing = len(songs)
-        elif status == '✅':
-            done = len(songs)
-    return songs, (playing or done)
+        if status.startswith('▶') or status == '✅':
+            state[source] = len(songs)      # everything up to the last done/playing song of a list is done
+            if status.startswith('▶'):
+                state['now'] = source
+    return songs, state
 
 def format_export() -> str:
     lines = ["1. List song"]
@@ -234,18 +271,19 @@ def _clean_title(title: str) -> str:
 def build_ngintip_lines(author=None, hint=True):
     """Lines for !ngintip. With `author`, starts with that person's own request(s) if they have any."""
     total = len(song_list)
+    now_id = now_playing_id()
     lines = []
     has_requested = False
 
     if author:
         mine = [i for i in sorted(song_list) if _norm_name(song_list[i][1]) == _norm_name(author)]
         has_requested = bool(mine)
-        upcoming = [i for i in mine if i > played_idx]
-        if played_idx in mine:
-            lines.append(f"Lagu yg kamu request {_clean_title(song_list[played_idx][0])} lagi dinyanyiin sekarang (urutan ke - {played_idx}).")
+        upcoming = [i for i in mine if song_status(i) == 'pending']
+        if now_id and now_id in mine:
+            lines.append(f"Lagu yg kamu request {_clean_title(song_list[now_id][0])} lagi dinyanyiin sekarang (urutan ke - {now_id}).")
         for i in upcoming[:3]:
             lines.append(f"Lagu yg kamu request {_clean_title(song_list[i][0])} ada di urutan ke - {i}.")
-        if mine and not upcoming and played_idx not in mine:
+        if mine and not upcoming and now_id not in mine:
             last = mine[-1]
             lines.append(f"Lagu yg kamu request {_clean_title(song_list[last][0])} sudah dinyanyiin (urutan ke - {last}).")
         if lines:
@@ -253,18 +291,25 @@ def build_ngintip_lines(author=None, hint=True):
 
     if not song_list:
         lines.append("Queue masih kosong.")
-    elif played_idx == 0:
+    elif not now_id:
         lines.append("Lily belum mulai nyanyi, sebentar lagi ya!")
     else:
-        lines.append(f"Sekarang Lily lagi nyanyiin {_clean_title(song_list[played_idx][0])} di urutan ke - {played_idx} dari {total} Lagu")
+        lines.append(f"Sekarang Lily lagi nyanyiin {_clean_title(song_list[now_id][0])} di urutan ke - {now_id} dari {total} Lagu")
 
-    next_ids = [played_idx + k for k in range(1, 4) if (played_idx + k) in song_list]
-    if next_ids:
+    # Next 3 YouTube songs + next 1 Trakteer song (each list has its own !next)
+    yt_ids = [i for i in sorted(song_list)
+              if song_source(song_list[i]) == 'youtube' and song_status(i) == 'pending'][:3]
+    trakteer_id = next_in_source('trakteer')
+    if yt_ids:
         lines.append("")
-        lines.append(f"{len(next_ids)} Lagu yg bakal Lily nyanyiin ada :")
-        for n, i in enumerate(next_ids, start=1):
+        lines.append(f"{len(yt_ids)} Lagu yg bakal Lily nyanyiin ada :")
+        for n, i in enumerate(yt_ids, start=1):
             lines.append(f"{n}. {song_list[i][1]} - {_clean_title(song_list[i][0])}")
-    elif song_list and played_idx > 0:
+    if trakteer_id:
+        if not yt_ids:
+            lines.append("")
+        lines.append(f"💚 Trakteer berikutnya : {song_list[trakteer_id][1]} - {_clean_title(song_list[trakteer_id][0])}")
+    if song_list and now_id and not yt_ids and not trakteer_id:
         lines.append("")
         lines.append("Belum ada lagu selanjutnya.")
 
@@ -451,7 +496,7 @@ async def hello(ctx):
 @bot.command(name='start_live_chat')
 async def start_live_chat(ctx, url: str, fresh: str = ""):
     """Start monitoring YouTube live chat and send messages to current Discord channel"""
-    global song_list, played_idx  # current_idx_ref is a dict, no need to declare global
+    global song_list  # current_idx_ref is a dict, no need to declare global
     
     if not youtube_client:
         await ctx.send("❌ YouTube API is not configured. Please check your API key.")
@@ -475,7 +520,7 @@ async def start_live_chat(ctx, url: str, fresh: str = ""):
     if not restored:
         song_list.clear()
         current_idx_ref['value'] = 0
-        played_idx = 0
+        reset_play_state()
         processed_messages.clear()
     reset_pause()
     save_cache()
@@ -603,101 +648,62 @@ async def live_status(ctx):
 
 @bot.command(name='current_song')
 async def current_song(ctx):
-    """Check the current song"""
+    """Check the current song (and what each list plays next)"""
     song_embed = discord.Embed(
         title="Lily Current Song",
         color=discord.Color.blue()
     )
-    
-    # Fix: Better logic for current song
     if not song_list:
-        song_embed.add_field(
-            name="Current Song",
-            value="Tidak ada lagu dalam queue saat ini!",
-            inline=False
-        )
-    elif played_idx == 0:
-        if current_idx_ref['value'] >= 1:
-            song_embed.add_field(
-                name="Current Song",
-                value=f"Belum ada lagu yang dimainkan. Next: {song_list[1][0]} - {song_list[1][1]}",
-                inline=False
-            )
-        else:
-            song_embed.add_field(
-                name="Current Song",
-                value="Tidak ada lagu dalam queue saat ini!",
-                inline=False
-            )
+        song_embed.add_field(name="Current Song", value="Tidak ada lagu dalam queue saat ini!", inline=False)
     else:
-        song_embed.add_field(
-            name="Current Song",
-            value=f"{song_list[played_idx][0]} - {song_list[played_idx][1]}", 
-            inline=False
-        )
+        now_id = now_playing_id()
+        if now_id:
+            now_text = f"#{now_id} {song_list[now_id][0]} - {song_list[now_id][1]}"
+        else:
+            now_text = "Belum ada lagu yang dimainkan."
+        song_embed.add_field(name="Current Song", value=now_text, inline=False)
+        for src, label in (('youtube', "Next YouTube (!next)"), ('trakteer', "Next Trakteer (!next_trakteer)")):
+            nid = next_in_source(src)
+            value = f"#{nid} {song_list[nid][0]} - {song_list[nid][1]}" if nid else "—"
+            song_embed.add_field(name=label, value=value, inline=False)
     await ctx.send(embed=song_embed)
+
+async def advance_list(ctx, source):
+    """Move one list (YouTube for !next, Trakteer for !next_trakteer) to its next song."""
+    label = "Trakteer" if source == 'trakteer' else "YouTube"
+    embed = discord.Embed(
+        title=f"Move to the next {label} song",
+        color=discord.Color.green() if source == 'trakteer' else discord.Color.dark_purple()
+    )
+    if not any(song_source(s) == source for s in song_list.values()):
+        embed.add_field(name="Queue Empty", value=f"Tidak ada lagu {label} dalam queue!", inline=False)
+    else:
+        nid = next_in_source(source)
+        if not nid:
+            embed.add_field(name="Info", value=f"Sudah di lagu terakhir di list {label}!", inline=False)
+        else:
+            play_state[source] = nid
+            play_state['now'] = source
+            embed.add_field(name="Now Playing", value=f"#{nid} {song_list[nid][0]} - {song_list[nid][1]}", inline=False)
+            following = next_in_source(source)
+            embed.add_field(
+                name=f"Next {label} Song",
+                value=f"#{following} {song_list[following][0]} - {song_list[following][1]}" if following else "Tidak ada lagu selanjutnya!",
+                inline=False
+            )
+    save_cache()
+    await ctx.send(embed=embed)
+    await send_song_list(ctx.channel)
 
 @bot.command(name='next')
 async def next(ctx):
-    """Move to the next song"""
-    global played_idx  # Fix: Add global declaration
-    
-    next_song = discord.Embed(
-        title="Move to the next song",
-        color=discord.Color.dark_purple()
-    )
-    
-    # Fix: Simplified and corrected logic
-    if not song_list:
-        next_song.add_field(
-            name="Queue Empty",
-            value="Tidak ada lagu dalam queue!",
-            inline=False
-        )
-    elif played_idx == 0 and current_idx_ref['value'] >= 1:
-        # Start playing the first song
-        played_idx = 1
-        next_song.add_field(
-            name="Now Playing",
-            value=f"{song_list[played_idx][0]} - {song_list[played_idx][1]}",
-            inline=False
-        )
-        if current_idx_ref['value'] > 1:
-            next_song.add_field(
-                name="Next Song",
-                value=f"{song_list[played_idx + 1][0]} - {song_list[played_idx + 1][1]}",
-                inline=False
-            )
-    elif played_idx < current_idx_ref['value']:
-        # Move to next song
-        played_idx += 1
-        next_song.add_field(
-            name="Now Playing",
-            value=f"{song_list[played_idx][0]} - {song_list[played_idx][1]}",
-            inline=False
-        )
-        if played_idx < current_idx_ref['value']:
-            next_song.add_field(
-                name="Next Song",
-                value=f"{song_list[played_idx + 1][0]} - {song_list[played_idx + 1][1]}",
-                inline=False
-            )
-        else:
-            next_song.add_field(
-                name="Next Song",
-                value="Tidak ada lagu selanjutnya!",
-                inline=False
-            )
-    else:
-        # Already at the last song
-        next_song.add_field(
-            name="Info",
-            value="Sudah di lagu terakhir!",
-            inline=False
-        )
-    save_cache()
-    await ctx.send(embed=next_song)
-    await send_song_list(ctx.channel)
+    """Move to the next YouTube song"""
+    await advance_list(ctx, 'youtube')
+
+@bot.command(name='next_trakteer')
+async def next_trakteer(ctx):
+    """Move to the next Trakteer song"""
+    await advance_list(ctx, 'trakteer')
 
 def split_song_request(raw: str):
     """Split '<song>-<requester>' on the LAST dash, so titles may contain dashes."""
@@ -751,8 +757,7 @@ async def add_yt(ctx, *, song):
 @bot.command(name='add_bulk')
 async def add_bulk(ctx, *, text: str):
     """Replace the queue with a pasted list (same format as !list_song / !export_song)"""
-    global played_idx
-    songs, new_played = parse_bulk(text)
+    songs, new_state = parse_bulk(text)
     if not songs:
         await ctx.send("❌ Tidak ada lagu yang terbaca. Format tiap lagu: `#1` lalu baris `✅ judul - @nama` (✅ = sudah, ▶️ = sedang, ⏳ = belum).")
         return
@@ -761,13 +766,13 @@ async def add_bulk(ctx, *, text: str):
     for n, song in enumerate(songs, start=1):
         song_list[n] = song
     current_idx_ref['value'] = len(songs)
-    played_idx = new_played
+    play_state.update(new_state)
 
     # Remember this queue for today in this channel
     cache_meta['channel_id'] = ctx.channel.id
     save_cache()
 
-    await ctx.send(f"✅ Queue di-restore: **{len(songs)}** lagu (sedang dimainkan: #{played_idx if played_idx else '-'}). Disimpan ke cache.")
+    await ctx.send(f"✅ Queue di-restore: **{len(songs)}** lagu (sedang dimainkan: #{now_playing_id() or '-'}). Disimpan ke cache.")
     await send_song_list(ctx.channel)
 
 @bot.command(name='export_song')
@@ -788,9 +793,10 @@ async def export_song(ctx):
 
 def _song_field(i):
     title, author = song_list[i][0], song_list[i][1]
-    if i < played_idx:
+    status = song_status(i)
+    if status == 'done':
         return f"#{i}", f"✅ {title} - {author}"
-    if i == played_idx:
+    if status == 'playing':
         return f"#{i} 🎵", f"▶️ {title} - {author}"
     return f"#{i}", f"⏳ {title} - {author}"
 
@@ -812,9 +818,10 @@ def _song_line(i):
     text = f"{title} - {author}"
     if len(text) > MAX_LINE_CHARS:
         text = text[:MAX_LINE_CHARS - 1] + "…"
-    if i < played_idx:
+    status = song_status(i)
+    if status == 'done':
         return f"✅ **#{i}** {text}"
-    if i == played_idx:
+    if status == 'playing':
         return f"▶️ **#{i} 🎵** {text}"
     return f"⏳ **#{i}** {text}"
 
@@ -830,7 +837,7 @@ def _build_list_embed(title, color, ids, page=None, source='youtube'):
             start = 0
         else:
             # NB: don't use builtin next() here, the !next command shadows it
-            pos = sum(1 for i in ids if i < played_idx)
+            pos = sum(1 for i in ids if i < play_state[source])
             start = max(0, min(pos - CONTEXT_PLAYED[source], len(ids) - size))
     else:
         start = (page - 1) * size
@@ -900,8 +907,9 @@ async def send_source_list(channel, source, page=None):
             footer = f"{len(ids)} song(s)"
         else:
             footer = f"Halaman {p}/{total_pages} | {len(ids)} song(s)"
+        footer += f" | {played_count(source)}/{len(ids)} played"
         if source == 'youtube':
-            footer += f" | {played_idx}/{len(song_list)} played | Total: {len(song_list)} songs"
+            footer += f" | Total: {len(song_list)} songs"
         embed.set_footer(text=footer)
         await channel.send(embed=embed)
 
@@ -940,17 +948,19 @@ async def list_song_trakteer(ctx, page: str = None):
 
 @bot.command(name='goto')
 async def goto(ctx, number: int):
-    """Set the current song to #number (everything before it counts as played)"""
-    global played_idx
+    """Set song #number as the one being sung (earlier songs of the same list count as played)"""
     if not song_list:
         await ctx.send("❌ Queue kosong.")
         return
     if number not in song_list:
         await ctx.send(f"❌ Nomor tidak valid. Pilih 1–{current_idx_ref['value']}.")
         return
-    played_idx = number
+    source = song_source(song_list[number])
+    play_state[source] = number
+    play_state['now'] = source
     save_cache()
-    await ctx.send(f"⏭️ Lagu sekarang: **#{number}** {song_list[number][0]} - {song_list[number][1]} (lagu sebelumnya ditandai ✅)")
+    label = "Trakteer" if source == 'trakteer' else "YouTube"
+    await ctx.send(f"⏭️ Lagu sekarang: **#{number}** {song_list[number][0]} - {song_list[number][1]} (lagu {label} sebelumnya ditandai ✅)")
     await send_song_list(ctx.channel)
 
 @bot.command(name='ngintip')
@@ -968,68 +978,45 @@ async def ngintip(ctx):
 @bot.command(name='delete')
 async def delete_song(ctx, song_id: int):
     """Delete a song from the queue by its ID"""
-    global played_idx
-    
     # Check if queue is empty
     if not song_list:
         await ctx.send("❌ Queue is empty! No songs to delete.")
         return
-    
+
     # Check if song_id is valid
     if song_id < 1 or song_id > current_idx_ref['value']:
         await ctx.send(f"❌ Invalid song ID! Please use a number between 1 and {current_idx_ref['value']}")
         return
-    
+
     # Check if song exists in the dictionary
     if song_id not in song_list:
         await ctx.send(f"❌ Song #{song_id} not found in queue!")
         return
-    
+
     # Check if trying to delete currently playing song
-    if song_id == played_idx:
-        await ctx.send("❌ Cannot delete the currently playing song! Use `!next` to skip it.")
+    if song_id == now_playing_id():
+        await ctx.send("❌ Cannot delete the currently playing song! Use `!next` / `!next_trakteer` to move on.")
         return
-    
-    # Store song info for confirmation message
+
     deleted_song = song_list[song_id]
-    
-    # Delete the song
-    del song_list[song_id]
-    
-    # Adjust played_idx if we deleted a song before the current one
-    if song_id < played_idx:
-        played_idx -= 1
-    
-    # Rebuild the song_list with consecutive IDs
-    if song_list:
-        # Create a new dictionary with consecutive IDs
-        old_song_list = song_list.copy()
-        song_list.clear()
-        
-        new_id = 1
-        old_played_id = played_idx
-        new_played_id = 0
-        
-        for old_id in range(1, current_idx_ref['value'] + 1):
-            if old_id in old_song_list:
-                song_list[new_id] = old_song_list[old_id]
-                
-                # Update played_idx to match the new numbering
-                if old_id == old_played_id:
-                    new_played_id = new_id
-                elif old_id < old_played_id and new_played_id == 0:
-                    new_played_id = new_id
-                
-                new_id += 1
-        
-        # Update global variables
-        current_idx_ref['value'] = len(song_list)
-        played_idx = new_played_id
-    else:
-        # Queue is now empty
-        current_idx_ref['value'] = 0
-        played_idx = 0
-    
+
+    # Renumber consecutively; each list's pointer follows (= new number of the last
+    # surviving song of that list at or below its old pointer)
+    old_ptr = {'youtube': play_state['youtube'], 'trakteer': play_state['trakteer']}
+    remaining = {i: s for i, s in song_list.items() if i != song_id}
+    song_list.clear()
+    new_ptr = {'youtube': 0, 'trakteer': 0}
+    for new_id, old_id in enumerate(sorted(remaining), start=1):
+        entry = remaining[old_id]
+        song_list[new_id] = entry
+        src = song_source(entry)
+        if old_id <= old_ptr[src]:
+            new_ptr[src] = new_id
+    current_idx_ref['value'] = len(song_list)
+    play_state.update(new_ptr)
+    if not song_list or (play_state['now'] and play_state[play_state['now']] == 0):
+        play_state['now'] = None
+
     # Send confirmation message
     embed = discord.Embed(
         title="Song Deleted",
@@ -1100,7 +1087,8 @@ async def help_live(ctx):
         name="🎛️ Atur Queue",
         value=(
             "```\n"
-            "!next                = Pindah ke lagu selanjutnya\n"
+            "!next                = Lagu YouTube berikutnya\n"
+            "!next_trakteer       = Lagu Trakteer berikutnya\n"
             "!goto <nomor>        = Set lagu yang sedang dimainkan\n"
             "!add <lagu>-<req>    = Tambah lagu Trakteer (list Trakteer)\n"
             "!add_yt <lagu>-<req> = Tambah lagu YouTube manual\n"
