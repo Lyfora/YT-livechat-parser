@@ -116,12 +116,18 @@ def save_cache():
     except Exception as e:
         print(f"Error saving cache: {e}")
 
-def restore_cache(channel_id) -> bool:
-    """Load today's queue for this channel into memory. True if a matching cache was found."""
+def restore_cache(channel_id, video_id=None) -> bool:
+    """Load today's queue for this channel + video into memory. True if a matching cache was found.
+
+    A cache saved with a video ID only matches that same video; a cache without one
+    (e.g. made by !add_bulk before the stream started) matches any video that day.
+    """
     try:
         with open(CACHE_FILE, encoding='utf-8') as f:
             data = json.load(f)
         if data.get('channel_id') != channel_id or data.get('date') != date.today().isoformat():
+            return False
+        if data.get('video_id') and video_id and data['video_id'] != video_id:
             return False
         restored = {int(k): v for k, v in data['song_list'].items()}
     except (FileNotFoundError, ValueError, KeyError, TypeError):
@@ -516,7 +522,7 @@ async def start_live_chat(ctx, url: str, fresh: str = ""):
     # `!start_live_chat <url> fresh` forces an empty queue.
     cache_meta['channel_id'] = ctx.channel.id
     cache_meta['video_id'] = video_id
-    restored = fresh.lower() != 'fresh' and restore_cache(ctx.channel.id)
+    restored = fresh.lower() != 'fresh' and restore_cache(ctx.channel.id, video_id)
     if not restored:
         song_list.clear()
         current_idx_ref['value'] = 0
@@ -770,6 +776,7 @@ async def add_bulk(ctx, *, text: str):
 
     # Remember this queue for today in this channel
     cache_meta['channel_id'] = ctx.channel.id
+    cache_meta['video_id'] = active_streams.get(ctx.channel.id)  # None if no stream yet: matches any video that day
     save_cache()
 
     await ctx.send(f"✅ Queue di-restore: **{len(songs)}** lagu (sedang dimainkan: #{now_playing_id() or '-'}). Disimpan ke cache.")
