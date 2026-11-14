@@ -324,6 +324,77 @@ def build_ngintip_lines(author=None, hint=True):
         lines.append("Pakai command !req <nama_lagu> untuk request ya, atau bisa via Trakteer :-)")
     return lines
 
+NGINTIP_HINT = "Pakai command !req <nama_lagu> untuk request ya, atau bisa via Trakteer :-)"
+
+def _short(text, n):
+    text = text.strip()
+    return text if len(text) <= n else text[:max(1, n - 1)].rstrip() + "…"
+
+def build_ngintip_compact(author, limit=YT_CHAT_LIMIT):
+    """YouTube-chat version of !ngintip: ONE single-line message (max 200 chars).
+
+    Song titles are shortened until everything fits. If the request hint (for people
+    without a request) doesn't fit as well, it follows as a second message.
+    Returns a list of 1-2 messages.
+    """
+    now_id = now_playing_id()
+    total = len(song_list)
+    mine = [i for i in sorted(song_list) if _norm_name(song_list[i][1]) == _norm_name(author)]
+    upcoming = [i for i in mine if song_status(i) == 'pending'][:3]
+    playing_mine = bool(now_id) and now_id in mine
+    yt_ids = [i for i in sorted(song_list)
+              if song_source(song_list[i]) == 'youtube' and song_status(i) == 'pending'][:3]
+    trakteer_id = next_in_source('trakteer')
+
+    def render(tmax, n_yt=3, with_trakteer=True):
+        nmax = tmax + 4  # requester names get a bit more room than titles
+
+        def title(i):
+            return _short(_clean_title(song_list[i][0]), tmax)
+
+        def who(i):
+            return _short(str(song_list[i][1]), nmax)
+
+        parts = []
+        if playing_mine or upcoming:
+            if len(upcoming) == 1 and not playing_mine:
+                parts.append(f"Lagu yg kamu request {title(upcoming[0])} ada di urutan ke - {upcoming[0]}")
+            else:
+                pieces = ([f"{title(now_id)} (lagi dinyanyiin)"] if playing_mine else [])
+                pieces += [f"{title(i)} (ke - {i})" for i in upcoming]
+                parts.append("Lagu yg kamu request: " + ", ".join(pieces))
+        elif mine:
+            parts.append(f"Lagu yg kamu request {title(mine[-1])} sudah dinyanyiin (urutan ke - {mine[-1]})")
+
+        if not song_list:
+            parts.append("Queue masih kosong")
+        elif not now_id:
+            parts.append("Lily belum mulai nyanyi")
+        else:
+            parts.append(f"Sekarang Lily nyanyiin {title(now_id)} (ke - {now_id} dari {total} Lagu)")
+        if yt_ids and n_yt:
+            parts.append("Next: " + ", ".join(f"{n}. {who(i)} - {title(i)}" for n, i in enumerate(yt_ids[:n_yt], start=1)))
+        if with_trakteer and trakteer_id:
+            parts.append(f"💚 {who(trakteer_id)} - {title(trakteer_id)}")
+        return f"{author} " + " | ".join(parts)
+
+    # Keep as much as possible: shorten titles first, then drop the least important parts
+    attempts = [(40, 3, True), (30, 3, True), (24, 3, True), (18, 3, True), (14, 3, True),
+                (14, 3, False), (12, 2, False), (10, 2, False), (10, 1, False), (10, 0, False)]
+    message = None
+    for tmax, n_yt, with_trakteer in attempts:
+        candidate = render(tmax, n_yt, with_trakteer)
+        if len(candidate) <= limit:
+            message = candidate
+            break
+    if message is None:
+        message = candidate[:limit - 1] + "…"
+
+    messages = [message]
+    if not mine:
+        messages.append(NGINTIP_HINT)  # always its own chat line, so the song info keeps the full 200 chars
+    return messages
+
 async def send_youtube_lines(live_chat_id, lines):
     """YouTube chat has no multi-line messages and a 200-char cap, so send one message per line."""
     for line in lines:
@@ -402,7 +473,7 @@ async def fetch_live_chat_messages(video_id: str, discord_channel):
                             continue
                         ngintip_user_cooldowns[key] = now
 
-                    lines = build_ngintip_lines(author)
+                    lines = build_ngintip_lines(author)  # full multi-line version for Discord
                     peek_embed = discord.Embed(
                         title="YouTube Chat Peek (!ngintip)",
                         description="\n".join(lines),
@@ -410,7 +481,7 @@ async def fetch_live_chat_messages(video_id: str, discord_channel):
                     )
                     peek_embed.set_author(name=author)
                     await discord_channel.send(embed=peek_embed)
-                    await send_youtube_lines(live_chat_id, lines)
+                    await send_youtube_lines(live_chat_id, build_ngintip_compact(author))  # 1 long chat
                     continue
 
                 # Only process messages that start with !req
