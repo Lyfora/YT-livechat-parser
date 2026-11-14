@@ -5,10 +5,13 @@ from dotenv import load_dotenv
 import os
 import asyncio
 import googleapiclient.discovery
+import googleapiclient.errors
 import re
 import webserver
 import time
 import pickle
+import json
+from datetime import date
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 
@@ -42,7 +45,98 @@ song_list = {}
 # current_idx is wrapped in a dict so webserver.py can mutate it from a different thread
 current_idx_ref = {'value': 0}
 played_idx = 0
+# When paused, no new songs are added (shared with webserver.py, hence the dict)
+paused_ref = {'value': False}
+# Auto-pause: once the queue holds `limit` songs, new YouTube-chat requests are ignored,
+# but manual adds (!add / !add_yt) and Trakteer donations are still accepted.
+auto_pause_ref = {'limit': None, 'notified': False}
+
+def reset_pause():
+    paused_ref['value'] = False
+    auto_pause_ref['limit'] = None
+    auto_pause_ref['notified'] = False
 last_ngintip_time = 0  # To track cooldown for !ngintip from YouTube chat
+
+# --- Queue cache (survives bot restarts; restored if same channel + same day) ---
+CACHE_FILE = 'queue_cache.json'
+processed_messages = set()  # YouTube chat message IDs already handled (persisted so a restart doesn't re-add old !req)
+cache_meta = {'channel_id': None, 'video_id': None}
+
+def song_source(entry) -> str:
+    """'trakteer' or 'youtube' for a queue entry (older entries have no source field)."""
+    if len(entry) > 2:
+        return entry[2]
+    return 'trakteer' if entry[0].startswith('(Trakteer)') else 'youtube'
+
+def save_cache():
+    if cache_meta['channel_id'] is None:
+        return
+    data = {
+        'channel_id': cache_meta['channel_id'],
+        'video_id': cache_meta['video_id'],
+        'date': date.today().isoformat(),
+        'song_list': {str(k): v for k, v in song_list.items()},
+        'current_idx': current_idx_ref['value'],
+        'played_idx': played_idx,
+        'processed_messages': list(processed_messages),
+    }
+    try:
+        tmp = CACHE_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, CACHE_FILE)
+    except Exception as e:
+        print(f"Error saving cache: {e}")
+
+def restore_cache(channel_id) -> bool:
+    """Load today's queue for this channel into memory. True if a matching cache was found."""
+    global played_idx
+    try:
+        with open(CACHE_FILE, encoding='utf-8') as f:
+            data = json.load(f)
+        if data.get('channel_id') != channel_id or data.get('date') != date.today().isoformat():
+            return False
+        restored = {int(k): v for k, v in data['song_list'].items()}
+    except (FileNotFoundError, ValueError, KeyError, TypeError):
+        return False
+    song_list.clear()
+    song_list.update(restored)
+    current_idx_ref['value'] = data.get('current_idx', len(song_list))
+    played_idx = data.get('played_idx', 0)
+    processed_messages.clear()
+    processed_messages.update(data.get('processed_messages', []))
+    return True
+
+_BULK_LINE = re.compile(r'^(✅|▶️?|⏳)\s*(.+)$')
+
+def parse_bulk(text: str):
+    """Parse a pasted '#N / ✅ title - author' list. Returns (songs, played_idx)."""
+    songs = []
+    playing = 0
+    done = 0
+    for raw in text.splitlines():
+        line = re.sub(r'^#\d+\s*🎵?\s*', '', raw.strip())  # allow '#1 ✅ ...' on one line
+        m = _BULK_LINE.match(line)
+        if not m or ' - ' not in m.group(2):
+            continue
+        status, body = m.groups()
+        title, author = body.rsplit(' - ', 1)  # titles may contain ' - ', the author is last
+        title, author = title.strip(), author.strip()
+        source = 'trakteer' if title.startswith('(Trakteer)') else 'youtube'
+        songs.append([title, author, source])
+        if status.startswith('▶'):
+            playing = len(songs)
+        elif status == '✅':
+            done = len(songs)
+    return songs, (playing or done)
+
+def format_export() -> str:
+    lines = ["1. List song"]
+    for i in sorted(song_list):
+        name, value = _song_field(i)
+        lines.append(name)
+        lines.append(value)
+    return "\n".join(lines)
 
 def extract_youtube_id(url: str) -> str:
     """Extract YouTube video ID from various URL formats"""
@@ -126,6 +220,70 @@ async def send_youtube_message(live_chat_id, text):
     except Exception as e:
         print(f"Error sending to YouTube: {e}")
 
+NGINTIP_COOLDOWN = 300          # seconds (5 min), per YouTube user; moderators/owner are exempt
+ngintip_user_cooldowns = {}     # normalized YT name -> last !ngintip time
+YT_CHAT_LIMIT = 200             # YouTube live chat messages max 200 chars, single line
+
+def _norm_name(name) -> str:
+    return str(name).strip().lstrip('@').casefold()
+
+def _clean_title(title: str) -> str:
+    prefix = "(Trakteer) - "
+    return title[len(prefix):] if title.startswith(prefix) else title
+
+def build_ngintip_lines(author=None, hint=True):
+    """Lines for !ngintip. With `author`, starts with that person's own request(s) if they have any."""
+    total = len(song_list)
+    lines = []
+    has_requested = False
+
+    if author:
+        mine = [i for i in sorted(song_list) if _norm_name(song_list[i][1]) == _norm_name(author)]
+        has_requested = bool(mine)
+        upcoming = [i for i in mine if i > played_idx]
+        if played_idx in mine:
+            lines.append(f"Lagu yg kamu request {_clean_title(song_list[played_idx][0])} lagi dinyanyiin sekarang (urutan ke - {played_idx}).")
+        for i in upcoming[:3]:
+            lines.append(f"Lagu yg kamu request {_clean_title(song_list[i][0])} ada di urutan ke - {i}.")
+        if mine and not upcoming and played_idx not in mine:
+            last = mine[-1]
+            lines.append(f"Lagu yg kamu request {_clean_title(song_list[last][0])} sudah dinyanyiin (urutan ke - {last}).")
+        if lines:
+            lines.append("")
+
+    if not song_list:
+        lines.append("Queue masih kosong.")
+    elif played_idx == 0:
+        lines.append("Lily belum mulai nyanyi, sebentar lagi ya!")
+    else:
+        lines.append(f"Sekarang Lily lagi nyanyiin {_clean_title(song_list[played_idx][0])} di urutan ke - {played_idx} dari {total} Lagu")
+
+    next_ids = [played_idx + k for k in range(1, 4) if (played_idx + k) in song_list]
+    if next_ids:
+        lines.append("")
+        lines.append(f"{len(next_ids)} Lagu yg bakal Lily nyanyiin ada :")
+        for n, i in enumerate(next_ids, start=1):
+            lines.append(f"{n}. {song_list[i][1]} - {_clean_title(song_list[i][0])}")
+    elif song_list and played_idx > 0:
+        lines.append("")
+        lines.append("Belum ada lagu selanjutnya.")
+
+    if hint and not has_requested:
+        lines.append("")
+        lines.append("Pakai command !req <nama_lagu> untuk request ya, atau bisa via Trakteer :-)")
+    return lines
+
+async def send_youtube_lines(live_chat_id, lines):
+    """YouTube chat has no multi-line messages and a 200-char cap, so send one message per line."""
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if len(line) > YT_CHAT_LIMIT:
+            line = line[:YT_CHAT_LIMIT - 1] + "…"
+        await send_youtube_message(live_chat_id, line)
+        await asyncio.sleep(1)
+
 async def get_live_chat_id(video_id: str) -> str:
     """Get the live chat ID for a YouTube video"""
     try:
@@ -157,8 +315,8 @@ async def fetch_live_chat_messages(video_id: str, discord_channel):
     await discord_channel.send(f"✅ Started monitoring live chat for video: `{video_id}`")
     
     next_page_token = None
-    processed_messages = set()  # To avoid duplicate messages
-    
+    # processed_messages is module-level (and cached) so a restart doesn't re-add old !req
+
     try:
         while discord_channel.id in active_streams and active_streams[discord_channel.id] == video_id:
             response = youtube_client.liveChatMessages().list(
@@ -182,47 +340,49 @@ async def fetch_live_chat_messages(video_id: str, discord_channel):
                     continue  # skip system/non-text messages
                 author = item["authorDetails"]["displayName"]
                 
-                # Handle !ngintip (peek at upcoming songs)
+                # Handle !ngintip (personalised queue peek, per-user cooldown)
                 if message_text.lower().startswith('!ngintip'):
-                    current_time = time.time()
-                    global last_ngintip_time
-                    
-                    if current_time - last_ngintip_time < 120:
-                        # Still on cooldown
-                        continue
-                    
-                    last_ngintip_time = current_time
-                    next_songs = []
-                    # Get next 3 songs after played_idx
-                    for i in range(1, 4):
-                        target_id = played_idx + i
-                        if target_id in song_list:
-                            next_songs.append(f"#{target_id}: {song_list[target_id][0]} ({song_list[target_id][1]})")
-                    
-                    if next_songs:
-                        peek_text = "👀 **Top Upcoming Songs:**\n" + "\n".join(next_songs)
-                    else:
-                        peek_text = "👀 **Queue is empty!** No upcoming songs."
-                    
+                    details = item["authorDetails"]
+                    is_staff = bool(details.get("isChatModerator") or details.get("isChatOwner"))
+                    key = _norm_name(author)
+                    now = time.time()
+                    if not is_staff:  # chat moderators (and the channel owner) have no cooldown
+                        if now - ngintip_user_cooldowns.get(key, 0) < NGINTIP_COOLDOWN:
+                            continue
+                        ngintip_user_cooldowns[key] = now
+
+                    lines = build_ngintip_lines(author)
                     peek_embed = discord.Embed(
                         title="YouTube Chat Peek (!ngintip)",
-                        description=peek_text,
+                        description="\n".join(lines),
                         color=discord.Color.gold()
                     )
                     peek_embed.set_author(name=author)
                     await discord_channel.send(embed=peek_embed)
-                    
-                    # Also send to YouTube Live Chat
-                    # Remove markdown from peek_text for YouTube
-                    yt_text = peek_text.replace("**", "")
-                    await send_youtube_message(live_chat_id, yt_text)
-                    
+                    await send_youtube_lines(live_chat_id, lines)
                     continue
 
                 # Only process messages that start with !req
                 if not message_text.lower().startswith('!req'):
                     continue
-                
+
+                # Paused: ignore new requests until !continue
+                if paused_ref['value']:
+                    continue
+
+                # Auto-pause: queue already holds `limit` songs -> ignore new chat requests
+                limit = auto_pause_ref['limit']
+                if limit is not None and len(song_list) >= limit:
+                    if not auto_pause_ref['notified']:
+                        auto_pause_ref['notified'] = True
+                        await discord_channel.send(
+                            f"⏸️ **Auto-pause:** queue sudah {len(song_list)} lagu (limit {limit}). "
+                            "Request baru dari YouTube chat diabaikan; `!add` / `!add_yt` / Trakteer tetap diterima. "
+                            "Pakai `!continue` untuk membuka lagi."
+                        )
+                    continue
+                auto_pause_ref['notified'] = False
+
                 # Create an embed for better formatting
                 embed = discord.Embed(
                     description=message_text,
@@ -232,21 +392,34 @@ async def fetch_live_chat_messages(video_id: str, discord_channel):
                 embed.set_footer(text="YouTube Live Chat")
                 
                 # Create song list
-                song_list_temp = message_text[5:]
+                song_list_temp = message_text[5:].strip()
 
                 # Add it to the list
                 current_idx_ref['value'] += 1
-                song_list[current_idx_ref['value']] = [song_list_temp, author]
-                
+                song_list[current_idx_ref['value']] = [song_list_temp, author, 'youtube']
+                save_cache()
+
                 await discord_channel.send(embed=embed)
                 await send_song_list(discord_channel)
 
             next_page_token = response.get("nextPageToken")
-            
+            save_cache()  # also persists processed message IDs
+
             # Wait before polling again (YouTube API recommends polling interval)
             poll_interval = response.get("pollingIntervalMillis", 5000) / 1000
-            await asyncio.sleep(max(poll_interval, 20))  # Minimum 20 seconds
-            
+            # Minimum 20 seconds, slept in 1s steps so !stop_live_chat takes effect quickly
+            for _ in range(int(max(poll_interval, 20))):
+                if active_streams.get(discord_channel.id) != video_id:
+                    break
+                await asyncio.sleep(1)
+
+    except googleapiclient.errors.HttpError as e:
+        status = getattr(e.resp, 'status', None)
+        if status in (403, 404) and ('liveChatEnded' in str(e) or 'liveChatNotFound' in str(e)):
+            await discord_channel.send("📴 Live stream sudah selesai (live chat ditutup). Queue tetap tersimpan di cache hari ini.")
+        else:
+            await discord_channel.send(f"❌ Error while fetching live chat: {e}")
+        print(f"Live chat fetch error: {e}")
     except Exception as e:
         await discord_channel.send(f"❌ Error while fetching live chat: {e}")
         print(f"Live chat fetch error: {e}")
@@ -254,7 +427,8 @@ async def fetch_live_chat_messages(video_id: str, discord_channel):
     # Clean up when done
     if discord_channel.id in active_streams:
         del active_streams[discord_channel.id]
-    
+    reset_pause()
+
     await discord_channel.send("🛑 Stopped monitoring live chat.")
 
 @bot.event
@@ -275,7 +449,7 @@ async def hello(ctx):
     await ctx.send(f"Hello {ctx.author.mention}! 👋")
 
 @bot.command(name='start_live_chat')
-async def start_live_chat(ctx, url: str):
+async def start_live_chat(ctx, url: str, fresh: str = ""):
     """Start monitoring YouTube live chat and send messages to current Discord channel"""
     global song_list, played_idx  # current_idx_ref is a dict, no need to declare global
     
@@ -293,18 +467,29 @@ async def start_live_chat(ctx, url: str):
         await ctx.send(f"❌ Already monitoring a live chat in this channel. Use `!stop_live_chat` first.")
         return
     
-    # Reset the queue for new stream
-    song_list.clear()
-    current_idx_ref['value'] = 0
-    played_idx = 0
-    
+    # Same channel + same day => restore the cached queue (survives bot restarts).
+    # `!start_live_chat <url> fresh` forces an empty queue.
+    cache_meta['channel_id'] = ctx.channel.id
+    cache_meta['video_id'] = video_id
+    restored = fresh.lower() != 'fresh' and restore_cache(ctx.channel.id)
+    if not restored:
+        song_list.clear()
+        current_idx_ref['value'] = 0
+        played_idx = 0
+        processed_messages.clear()
+    reset_pause()
+    save_cache()
+
     # Store the active stream
     active_streams[ctx.channel.id] = video_id
-    
+
     # Start fetching live chat in the background
     bot.loop.create_task(fetch_live_chat_messages(video_id, ctx.channel))
-    
+
     await ctx.send(f"🔄 Starting to monitor live chat for video: `{video_id}`")
+    if restored:
+        await ctx.send(f"♻️ Queue hari ini di-restore dari cache ({len(song_list)} lagu). Pakai `!start_live_chat <link> fresh` untuk mulai dari kosong.")
+        await send_song_list(ctx.channel)
 
 @bot.command(name='stop_live_chat')
 async def stop_live_chat(ctx):
@@ -315,7 +500,97 @@ async def stop_live_chat(ctx):
     
     # Remove from active streams (this will stop the fetch loop)
     del active_streams[ctx.channel.id]
+    reset_pause()
     await ctx.send("🛑 Stopped live chat monitoring for this channel.")
+
+def collect_requesters():
+    """Unique requester names (first-appearance order): (trakteer_names, youtube_names)."""
+    trakteer, youtube = [], []
+    seen = {'trakteer': set(), 'youtube': set()}
+    for i in sorted(song_list):
+        entry = song_list[i]
+        name = str(entry[1]).strip()
+        source = song_source(entry)
+        if not name or name.lower() in seen[source]:
+            continue
+        seen[source].add(name.lower())
+        (trakteer if source == 'trakteer' else youtube).append(name)
+    return trakteer, youtube
+
+def shoutout_messages(prefix, names, suffix="", limit=1800):
+    """Build message(s) '<prefix><name, name, ...><suffix>', splitting if a list is too long for Discord."""
+    names = [discord.utils.escape_markdown(n) for n in names]
+    messages, current = [], []
+    for name in names:
+        candidate = prefix + ", ".join(current + [name]) + suffix
+        if current and len(candidate) > limit:
+            messages.append(prefix + ", ".join(current) + suffix)
+            current = []
+        current.append(name)
+    if current:
+        messages.append(prefix + ", ".join(current) + suffix)
+    return messages
+
+@bot.command(name='end_live_stream')
+async def end_live_stream(ctx):
+    """Shout out everyone who requested (Trakteer + YouTube), then stop monitoring"""
+    trakteer, youtube = collect_requesters()
+    if not trakteer and not youtube and ctx.channel.id not in active_streams:
+        await ctx.send("❌ Tidak ada live stream aktif dan queue kosong.")
+        return
+
+    no_mentions = discord.AllowedMentions.none()  # names are user-provided: never ping anyone
+    await ctx.send("🎉 **Stream selesai! Makasih semuanya!**")
+    for msg in shoutout_messages("💚 Thank you for Trakteer ", trakteer):
+        await ctx.send(msg, allowed_mentions=no_mentions)
+    for msg in shoutout_messages("🙏 Thank you for requesting ", youtube, " from YT"):
+        await ctx.send(msg, allowed_mentions=no_mentions)
+
+    if ctx.channel.id in active_streams:
+        del active_streams[ctx.channel.id]  # the fetch loop stops on its own
+        reset_pause()
+        await ctx.send("🛑 Stopped live chat monitoring for this channel. (Queue tetap tersimpan di cache hari ini.)")
+
+@bot.command(name='pause')
+async def pause(ctx, limit: int = None):
+    """!pause = stop all new songs; !pause <n> = auto-pause YouTube requests once the queue has n songs"""
+    if ctx.channel.id not in active_streams:
+        await ctx.send("❌ Tidak bisa pause: belum ada live stream yang dimonitor di channel ini. Gunakan `!start_live_chat <link>` dulu.")
+        return
+
+    if limit is None:
+        if paused_ref['value']:
+            await ctx.send("⏸️ Sudah dalam kondisi pause. Gunakan `!continue` untuk lanjut.")
+            return
+        paused_ref['value'] = True
+        await ctx.send("⏸️ **Paused.** Request dari YouTube chat diabaikan sampai kamu pakai `!continue`. `!add`, `!add_yt` dan Trakteer tetap diterima.")
+        return
+
+    if limit < 1:
+        await ctx.send("❌ Limit harus minimal 1. Contoh: `!pause 20`")
+        return
+    auto_pause_ref['limit'] = limit
+    auto_pause_ref['notified'] = False
+    count = len(song_list)
+    status = "sudah tercapai, request YouTube baru langsung diabaikan" if count >= limit else "request YouTube diterima sampai limit"
+    await ctx.send(
+        f"⏸️ **Auto-pause {limit} lagu** aktif (queue sekarang {count}/{limit}: {status}). "
+        "`!add`, `!add_yt` dan Trakteer tetap diterima. `!continue` untuk mematikan."
+    )
+
+@bot.command(name='continue')
+async def continue_(ctx):
+    """Resume accepting new songs (clears both !pause and !pause <n>)"""
+    if ctx.channel.id not in active_streams:
+        await ctx.send("❌ Tidak ada live stream yang dimonitor di channel ini.")
+        return
+    if not paused_ref['value'] and auto_pause_ref['limit'] is None:
+        await ctx.send("▶️ Bot tidak sedang pause.")
+        return
+    paused_ref['value'] = False
+    auto_pause_ref['limit'] = None
+    auto_pause_ref['notified'] = False
+    await ctx.send("▶️ **Lanjut!** Request lagu baru diterima lagi.")
 
 @bot.command(name='live_status')
 async def live_status(ctx):
@@ -420,122 +695,271 @@ async def next(ctx):
             value="Sudah di lagu terakhir!",
             inline=False
         )
+    save_cache()
     await ctx.send(embed=next_song)
+    await send_song_list(ctx.channel)
+
+def split_song_request(raw: str):
+    """Split '<song>-<requester>' on the LAST dash, so titles may contain dashes."""
+    if '-' not in raw:
+        return None
+    title, name = raw.rsplit('-', 1)
+    title, name = title.strip(), name.strip()
+    if not title or not name:
+        return None
+    return title, name
+
+async def manual_add(ctx, raw: str, source: str):
+    """Shared logic for !add (Trakteer) and !add_yt (YouTube)."""
+    if ctx.channel.id not in active_streams:
+        await ctx.send("❌ No active live chat monitoring in this channel.")
+        return
+    # !pause / !pause <n> only affect YouTube chat requests; manual adds are never blocked.
+    parsed = split_song_request(raw)
+    if not parsed:
+        cmd = 'add' if source == 'trakteer' else 'add_yt'
+        await ctx.send(f"❌ Format salah. Pakai: `!{cmd} <nama lagu>-<nama yang request>`")
+        return
+    title, requester = parsed
+
+    if source == 'trakteer':
+        display = "(Trakteer) - " + title
+        embed = discord.Embed(description=display, color=discord.Color.green())
+        embed.set_footer(text="Trakteer Request Chat 💚")
+    else:
+        display = title
+        embed = discord.Embed(description=display, color=discord.Color.red())
+        embed.set_footer(text="YouTube Request (manual)")
+    embed.set_author(name=requester)
+
+    current_idx_ref['value'] += 1
+    song_list[current_idx_ref['value']] = [display, requester, source]
+    save_cache()
+    await ctx.send(embed=embed)
     await send_song_list(ctx.channel)
 
 @bot.command(name='add')
 async def add(ctx, *, song):
-    """Add song from Trakteer"""
-    if ctx.channel.id in active_streams:
-        print(song, song.split("-"))
-        song_list_format = "(Trakteer) - " + song.split("-")[0]
-        nama_request = song.split("-")[1]
-        current_idx_ref['value'] += 1
+    """Add a Trakteer song (goes to the Trakteer list)"""
+    await manual_add(ctx, song, 'trakteer')
 
-        song_list[current_idx_ref['value']] = [song_list_format, nama_request]
-        embed = discord.Embed(
-                    description=song_list_format,
-                    color=discord.Color.red()
-                )
-        embed.set_author(name=nama_request)
-        embed.set_footer(text="Trakteer Request Chat")
-        await ctx.send(embed=embed)
-        await send_song_list(ctx.channel)
+@bot.command(name='add_yt')
+async def add_yt(ctx, *, song):
+    """Add a YouTube-chat song manually (goes to the YouTube list)"""
+    await manual_add(ctx, song, 'youtube')
+
+@bot.command(name='add_bulk')
+async def add_bulk(ctx, *, text: str):
+    """Replace the queue with a pasted list (same format as !list_song / !export_song)"""
+    global played_idx
+    songs, new_played = parse_bulk(text)
+    if not songs:
+        await ctx.send("❌ Tidak ada lagu yang terbaca. Format tiap lagu: `#1` lalu baris `✅ judul - @nama` (✅ = sudah, ▶️ = sedang, ⏳ = belum).")
+        return
+
+    song_list.clear()
+    for n, song in enumerate(songs, start=1):
+        song_list[n] = song
+    current_idx_ref['value'] = len(songs)
+    played_idx = new_played
+
+    # Remember this queue for today in this channel
+    cache_meta['channel_id'] = ctx.channel.id
+    save_cache()
+
+    await ctx.send(f"✅ Queue di-restore: **{len(songs)}** lagu (sedang dimainkan: #{played_idx if played_idx else '-'}). Disimpan ke cache.")
+    await send_song_list(ctx.channel)
+
+@bot.command(name='export_song')
+async def export_song(ctx):
+    """Post a copy-pasteable text version of the queue (re-importable with !add_bulk)"""
+    if not song_list:
+        await ctx.send("❌ Queue kosong, tidak ada yang di-copy.")
+        return
+    lines = format_export().split("\n")
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 1800:
+            await ctx.send(f"```\n{chunk}```")
+            chunk = ""
+        chunk += line + "\n"
+    if chunk:
+        await ctx.send(f"```\n{chunk}```")
+
+def _song_field(i):
+    title, author = song_list[i][0], song_list[i][1]
+    if i < played_idx:
+        return f"#{i}", f"✅ {title} - {author}"
+    if i == played_idx:
+        return f"#{i} 🎵", f"▶️ {title} - {author}"
+    return f"#{i}", f"⏳ {title} - {author}"
+
+MAX_SHOWN_TOTAL = 20     # max songs shown across both lists in one view (Discord-friendly)
+MAX_SHOWN_TRAKTEER = 5   # max Trakteer songs shown
+
+def page_size(source):
+    """Trakteer: up to 5. YouTube: whatever is left of 20 (4 Trakteer shown -> 16, 5 -> 15)."""
+    trakteer_shown = min(MAX_SHOWN_TRAKTEER, sum(1 for s in song_list.values() if song_source(s) == 'trakteer'))
+    if source == 'trakteer':
+        return MAX_SHOWN_TRAKTEER
+    return MAX_SHOWN_TOTAL - trakteer_shown
+CONTEXT_PLAYED = {'trakteer': 1, 'youtube': 2}  # already-played songs kept above the current one
+MAX_DESC_CHARS = 3800  # embed description hard limit is 4096; stay well under
+MAX_LINE_CHARS = 150
+
+def _song_line(i):
+    title, author = song_list[i][0], song_list[i][1]
+    text = f"{title} - {author}"
+    if len(text) > MAX_LINE_CHARS:
+        text = text[:MAX_LINE_CHARS - 1] + "…"
+    if i < played_idx:
+        return f"✅ **#{i}** {text}"
+    if i == played_idx:
+        return f"▶️ **#{i} 🎵** {text}"
+    return f"⏳ **#{i}** {text}"
+
+def _build_list_embed(title, color, ids, page=None, source='youtube'):
+    """One embed with up to page_size(source) songs, one line per song.
+
+    page=None -> window around the current song; page=N -> Nth block of that many songs.
+    """
+    size = page_size(source)
+    total_pages = max(1, -(-len(ids) // size))
+    if page is None:
+        if len(ids) <= size:
+            start = 0
+        else:
+            # NB: don't use builtin next() here, the !next command shadows it
+            pos = sum(1 for i in ids if i < played_idx)
+            start = max(0, min(pos - CONTEXT_PLAYED[source], len(ids) - size))
     else:
-        await ctx.send("❌ No active live chat monitoring in this channel.")
+        start = (page - 1) * size
+    shown = ids[start:start + size]
+
+    def render(shown):
+        lines = []
+        if start > 0:
+            lines.append(f"⏸️ {start} lagu sebelumnya disembunyikan (`!list_song <halaman>` / `!list_song all`)")
+        lines.extend(_song_line(i) for i in shown)
+        more = len(ids) - (start + len(shown))
+        if more > 0:
+            lines.append(f"➕ {more} lagu lagi (`!list_song <halaman>` / `!list_song all`)")
+        return "\n".join(lines)
+
+    desc = render(shown)
+    while len(desc) > MAX_DESC_CHARS and len(shown) > 1:  # long titles: drop from the far end
+        shown = shown[:-1]
+        desc = render(shown)
+
+    embed = discord.Embed(title=title, description=desc or "—", color=color)
+    return embed, total_pages
+
+def _parse_page_arg(arg):
+    """None -> window, 'all' -> everything, '<n>' -> page n. Raises ValueError on junk."""
+    if arg is None:
+        return None
+    if arg.lower() == 'all':
+        return 'all'
+    if arg.isdigit() and int(arg) >= 1:
+        return int(arg)
+    raise ValueError(arg)
+
+async def send_source_list(channel, source, page=None):
+    """Send the Trakteer or YouTube list. page: None (window), int, or 'all'."""
+    ids = sorted(i for i, s in song_list.items() if song_source(s) == source)
+    if source == 'trakteer':
+        title, color = "💚 Trakteer List (Priority)", discord.Color.green()
+    else:
+        title, color = "List song", discord.Color.magenta()
+
+    if not ids:
+        embed = discord.Embed(title=title, color=color)
+        if source == 'trakteer':
+            embed.description = "Belum ada request Trakteer."
+        elif not song_list:
+            embed.description = "Tidak ada lagu dalam queue!"
+        else:
+            embed.description = "Belum ada request dari YouTube."
+        await channel.send(embed=embed)
+        return
+
+    total_pages = max(1, -(-len(ids) // page_size(source)))
+    if page == 'all':
+        pages = list(range(1, total_pages + 1))
+    elif page is None:
+        pages = [None]
+    elif page > total_pages:
+        await channel.send(f"❌ Halaman {page} tidak ada. {title} hanya punya {total_pages} halaman.")
+        return
+    else:
+        pages = [page]
+
+    for p in pages:
+        embed, _ = _build_list_embed(title, color, ids, p, source)
+        if p is None:
+            footer = f"{len(ids)} song(s)"
+        else:
+            footer = f"Halaman {p}/{total_pages} | {len(ids)} song(s)"
+        if source == 'youtube':
+            footer += f" | {played_idx}/{len(song_list)} played | Total: {len(song_list)} songs"
+        embed.set_footer(text=footer)
+        await channel.send(embed=embed)
 
 async def send_song_list(channel):
-    """Build and send the full queue embed to any channel."""
-    queue_embed = discord.Embed(
-        title="List song",
-        color=discord.Color.magenta()
-    )
-    
-    if not song_list:
-        queue_embed.add_field(
-            name="Queue Status",
-            value="Tidak ada lagu dalam queue!",
-            inline=False
-        )
-    else:
-        total_songs = len(song_list)
-        
-        if total_songs <= 24:
-            songs_to_show = list(range(1, current_idx_ref['value'] + 1))
-        else:
-            songs_to_show = []
-            if played_idx > 0:
-                start_played = max(1, played_idx - 2)
-                songs_to_show.extend(range(start_played, played_idx + 1))
-            if played_idx < current_idx_ref['value']:
-                songs_to_show.extend(range(played_idx + 1, current_idx_ref['value'] + 1))
-            if len(songs_to_show) > 23:
-                if played_idx > 0:
-                    max_next_songs = min(22, current_idx_ref['value'] - played_idx)
-                    songs_to_show = [played_idx] + list(range(played_idx + 1, played_idx + 1 + max_next_songs))
-                else:
-                    max_songs = min(23, current_idx_ref['value'])
-                    songs_to_show = list(range(1, max_songs + 1))
-        
-        show_gap = total_songs > 24 and played_idx > 3
-        
-        for song_id in songs_to_show:
-            if show_gap and song_id == played_idx and played_idx > 3:
-                queue_embed.add_field(
-                    name="...",
-                    value=f"⏸️ {played_idx - 3} songs skipped for display",
-                    inline=False
-                )
-            if song_id < played_idx:
-                queue_embed.add_field(
-                    name=f"#{song_id}",
-                    value=f"✅ {song_list[song_id][0]} - {song_list[song_id][1]}",
-                    inline=False
-                )
-            elif song_id == played_idx:
-                queue_embed.add_field(
-                    name=f"#{song_id} 🎵",
-                    value=f"▶️ {song_list[song_id][0]} - {song_list[song_id][1]}",
-                    inline=False
-                )
-            else:
-                queue_embed.add_field(
-                    name=f"#{song_id}",
-                    value=f"⏳ {song_list[song_id][0]} - {song_list[song_id][1]}",
-                    inline=False
-                )
-    
-    if song_list:
-        queue_embed.set_footer(text=f"{played_idx}/{len(song_list)} played | Total: {len(song_list)} songs")
-    else:
-        queue_embed.set_footer(text="No songs in queue")
-    
-    await channel.send(embed=queue_embed)
+    """Auto-post: Trakteer list on top (only if any), then the YouTube list. Windowed."""
+    if any(song_source(s) == 'trakteer' for s in song_list.values()):
+        await send_source_list(channel, 'trakteer')
+    await send_source_list(channel, 'youtube')
 
 @bot.command(name='list_song')
-async def list_song(ctx):
-    """Check the List Song Queue"""
+async def list_song(ctx, page: str = None):
+    """List queue. `!list_song` (window), `!list_song <n>` (YouTube page n), `!list_song all`"""
+    try:
+        parsed = _parse_page_arg(page)
+    except ValueError:
+        await ctx.send("❌ Pakai `!list_song`, `!list_song <halaman>` atau `!list_song all`.")
+        return
+    if parsed is None:
+        await send_song_list(ctx.channel)
+    elif parsed == 'all':
+        if any(song_source(s) == 'trakteer' for s in song_list.values()):
+            await send_source_list(ctx.channel, 'trakteer', 'all')
+        await send_source_list(ctx.channel, 'youtube', 'all')
+    else:
+        await send_source_list(ctx.channel, 'youtube', parsed)
+
+@bot.command(name='list_song_trakteer')
+async def list_song_trakteer(ctx, page: str = None):
+    """Show only the Trakteer list. `!list_song_trakteer [<n>|all]`"""
+    try:
+        parsed = _parse_page_arg(page)
+    except ValueError:
+        await ctx.send("❌ Pakai `!list_song_trakteer`, `!list_song_trakteer <halaman>` atau `!list_song_trakteer all`.")
+        return
+    await send_source_list(ctx.channel, 'trakteer', parsed)
+
+@bot.command(name='goto')
+async def goto(ctx, number: int):
+    """Set the current song to #number (everything before it counts as played)"""
+    global played_idx
+    if not song_list:
+        await ctx.send("❌ Queue kosong.")
+        return
+    if number not in song_list:
+        await ctx.send(f"❌ Nomor tidak valid. Pilih 1–{current_idx_ref['value']}.")
+        return
+    played_idx = number
+    save_cache()
+    await ctx.send(f"⏭️ Lagu sekarang: **#{number}** {song_list[number][0]} - {song_list[number][1]} (lagu sebelumnya ditandai ✅)")
     await send_song_list(ctx.channel)
 
 @bot.command(name='ngintip')
 @commands.cooldown(1, 120, commands.BucketType.guild)
 async def ngintip(ctx):
-    """Peek at the next 3 upcoming songs"""
-    next_songs = []
-    # Get next 3 songs after played_idx
-    for i in range(1, 4):
-        target_id = played_idx + i
-        if target_id in song_list:
-            next_songs.append(f"#{target_id}: {song_list[target_id][0]} ({song_list[target_id][1]})")
-    
-    if next_songs:
-        peek_text = "👀 **Top Upcoming Songs:**\n" + "\n".join(next_songs)
-    else:
-        peek_text = "👀 **Queue is empty!** No upcoming songs."
-    
+    """Peek at the current song and the next 3 upcoming songs"""
     peek_embed = discord.Embed(
         title="Queue Peek (!ngintip)",
-        description=peek_text,
+        description="\n".join(build_ngintip_lines(hint=False)),
         color=discord.Color.gold()
     )
     peek_embed.set_author(name=ctx.author.name)
@@ -622,6 +1046,7 @@ async def delete_song(ctx, song_id: int):
         inline=False
     )
     
+    save_cache()
     await ctx.send(embed=embed)
 
 
@@ -658,18 +1083,45 @@ async def help_live(ctx):
     )
 
     embed.add_field(
-        name="⚙️ Fitur Lainnya",
+        name="📋 Lihat Queue",
         value=(
             "```\n"
-            "- !list_song                = Menampilkan semua lagu, lengkap dengan status\n"
-            "- !current_song             = Menampilkan lagu yang sedang dinyanyikan\n"
-            "- !next                     = Pindah ke lagu selanjutnya\n"
-            "- !ngintip                  = Intip top 3 lagu selanjutnya di queue\n"
-            "- !add <lagu>-<req>         = Menambah lagu (khusus Trakteer)\n"
-            "- !start_live_chat <link>   = Memulai bot\n"
-            "- !end_live_chat            = Mematikan bot\n"
-            "- !ganti <lagu>-<req>       = (in progress) Ganti request\n"
-            "- !help_live                = Dokumentasi lainnya\n"
+            "!list_song [n|all]         = Semua lagu (total max 20, Trakteer max 5) + status\n"
+            "!list_song_trakteer [n|all] = Khusus list Trakteer\n"
+            "!current_song              = Lagu yang sedang dinyanyikan\n"
+            "!ngintip                   = Intip 3 lagu selanjutnya\n"
+            "!export_song               = Copy queue (bisa di-paste ke !add_bulk)\n"
+            "```"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🎛️ Atur Queue",
+        value=(
+            "```\n"
+            "!next                = Pindah ke lagu selanjutnya\n"
+            "!goto <nomor>        = Set lagu yang sedang dimainkan\n"
+            "!add <lagu>-<req>    = Tambah lagu Trakteer (list Trakteer)\n"
+            "!add_yt <lagu>-<req> = Tambah lagu YouTube manual\n"
+            "!add_bulk <list>     = Restore queue dari list yang di-paste\n"
+            "!ganti <lagu>-<req>  = (in progress) Ganti request\n"
+            "```"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="⚙️ Kontrol Bot",
+        value=(
+            "```\n"
+            "!start_live_chat <link>       = Memulai bot (restore queue hari ini)\n"
+            "!start_live_chat <link> fresh = Mulai dari queue kosong\n"
+            "!stop_live_chat               = Mematikan bot\n"
+            "!end_live_stream             = Shoutout requester + matikan bot\n"
+            "!pause / !continue            = Stop / lanjut terima chat YouTube\n"
+            "!pause <n>                    = Auto-pause chat YouTube di n lagu\n"
+            "!help_live                    = Dokumentasi ini\n"
             "```"
         ),
         inline=False
@@ -707,6 +1159,6 @@ if __name__ == "__main__":
         print("Error: YOUTUBE_API_KEY not found in environment variables")
     else:
         # Wire shared state into webserver so the Trakteer webhook can use it
-        webserver.setup(bot, song_list, active_streams, current_idx_ref, send_song_list)
+        webserver.setup(bot, song_list, active_streams, current_idx_ref, send_song_list, paused_ref, save_cache)
         webserver.keep_alive()
         bot.run(DISCORD_TOKEN, log_handler=handler, log_level=logging.DEBUG)

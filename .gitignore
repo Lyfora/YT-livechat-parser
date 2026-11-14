@@ -3,3 +3,5 @@ venv/
 token.pickle
 discord.log
 *.pyc
+queue_cache.json
+queue_cache.json.tmp

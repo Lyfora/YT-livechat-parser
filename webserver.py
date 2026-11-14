@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from threading import Thread
 import os
 import asyncio
+import hmac
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -13,13 +14,17 @@ _bot = None
 _song_list = None
 _active_streams = None
 _current_idx_ref = None
+_paused_ref = None
+_save_cache = None
 _send_song_list = None  # coroutine fn: async def send_song_list(channel)
 
 TRAKTEER_TOKEN = os.getenv('TRAKTEER_TOKEN', '')
 
-def setup(bot_instance, song_list, active_streams, idx_ref, send_song_list_fn):
+def setup(bot_instance, song_list, active_streams, idx_ref, send_song_list_fn, paused_ref=None, save_cache_fn=None):
     """Called from lily-bot.py to give this module access to bot state."""
-    global _bot, _song_list, _active_streams, _current_idx_ref, _send_song_list
+    global _bot, _song_list, _active_streams, _current_idx_ref, _send_song_list, _paused_ref, _save_cache
+    _paused_ref = paused_ref
+    _save_cache = save_cache_fn
     _bot = bot_instance
     _song_list = song_list
     _active_streams = active_streams
@@ -34,14 +39,12 @@ def home():
 def trakteer_webhook():
     # --- Debug logging ---
     logging.info("=== TRAKTEER WEBHOOK HIT ===")
-    logging.info(f"Headers: {dict(request.headers)}")
-    logging.info(f"Body: {request.get_data(as_text=True)}")
+    logging.info(f"Body: {request.get_data(as_text=True)}")  # headers are not logged: they contain the token
 
     # --- Token validation ---
     token = request.headers.get('X-Webhook-Token', '')
-    logging.info(f"Received token: '{token}' | Expected: '{TRAKTEER_TOKEN}'")
-    if TRAKTEER_TOKEN and token != TRAKTEER_TOKEN:
-        logging.warning("Token mismatch — returning 401")
+    if TRAKTEER_TOKEN and not hmac.compare_digest(token, TRAKTEER_TOKEN):
+        logging.warning("Webhook token mismatch — returning 401")
         return jsonify({"status": "error", "message": "Unauthorized"}), 401
 
     data = request.get_json(silent=True)
@@ -57,6 +60,9 @@ def trakteer_webhook():
     # Find the active discord channel
     if not _active_streams:
         return jsonify({"status": "error", "message": "No active stream"}), 400
+
+    # Note: !pause / !pause <n> only affect YouTube chat requests. Trakteer donations are paid,
+    # so they are always queued while a stream is active.
 
     # Pick the first active channel (there is typically only one)
     channel_id = next(iter(_active_streams))
@@ -80,7 +86,9 @@ async def _add_song_from_trakteer(channel, supporter_name: str, song_title: str)
     _current_idx_ref['value'] += 1
     idx = _current_idx_ref['value']
     song_display = f"(Trakteer) - {song_title}"
-    _song_list[idx] = [song_display, supporter_name]
+    _song_list[idx] = [song_display, supporter_name, 'trakteer']
+    if _save_cache:
+        _save_cache()
 
     embed = discord.Embed(
         description=song_display,
